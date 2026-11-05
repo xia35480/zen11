@@ -60,6 +60,19 @@ jobs:
             sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing
             sudo dpkg -i /tmp/cloudflare-warp.deb
           fi
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          ready=0
+          for i in $(seq 1 30); do
+            if sudo systemctl is-active --quiet warp-svc; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::cloudflare-warp daemon 未就绪"
+            sudo systemctl status warp-svc --no-pager || true
+            exit 1
+          fi
+          sleep 1
           sudo warp-cli --accept-tos registration new
           sudo warp-cli --accept-tos mode warp+doh
           sudo warp-cli --accept-tos connect
