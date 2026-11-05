@@ -264,7 +264,10 @@ while [ "$attempt" -lt "$BOOT_TRIES" ]; do
       if [ "$attempt" -lt "$BOOT_TRIES" ]; then
         warn "WARP 出口命中 429，立即重新注册获取全新出口 IPv4 (第 $attempt/$BOOT_TRIES 次)..."
         try_warp_refresh || true
-        sleep 2
+        stop_proc "$GW_PID" gateway
+        start_gateway
+        wait_local_health 60 || true
+        sleep 1
       else
         dump_boot_diag
         rotate "起手本地探测 429（换 IP 试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
@@ -316,6 +319,9 @@ while :; do
     say "捕获到日志 429，尝试 WARP 换 IP..."
     : > "$REASON"
     try_warp_refresh || true
+    stop_proc "$GW_PID" gateway
+    start_gateway
+    wait_local_health 60 || true
     probe_once "$BOOT_BASE" 30
     if [ "$(verdict)" != "ok" ]; then
       rotate "日志命中 429 且换 IP 后仍失败：$(head -c 200 "$REASON")" fast
@@ -357,6 +363,9 @@ while :; do
         limit_count=$((limit_count + 1))
         warn "周期探测 429，尝试 WARP 换 IP 自愈..."
         try_warp_refresh || true
+        stop_proc "$GW_PID" gateway
+        start_gateway
+        wait_local_health 60 || true
         probe_once
         if [ "$(verdict)" = "ok" ]; then
           say "WARP 换 IP 成功自愈！"
