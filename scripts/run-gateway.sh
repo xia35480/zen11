@@ -316,6 +316,7 @@ while :; do
   sleep 15
 
   if [ -s "$REASON" ]; then
+    reason_msg="$(head -c 200 "$REASON")"
     say "捕获到日志 429，尝试 WARP 换 IP..."
     : > "$REASON"
     try_warp_refresh || true
@@ -324,7 +325,7 @@ while :; do
     wait_local_health 60 || true
     probe_once "$BOOT_BASE" 30
     if [ "$(verdict)" != "ok" ]; then
-      rotate "日志命中 429 且换 IP 后仍失败：$(head -c 200 "$REASON")" fast
+      rotate "日志命中 429 且换 IP 后仍失败：$reason_msg" fast
     else
       say "WARP 换 IP 成功自愈！"
     fi
