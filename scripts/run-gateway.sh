@@ -32,6 +32,8 @@ PUBLIC_URL=""
 ok_count=0
 fail_count=0
 limit_count=0
+log_429_count=0
+log_429_last=0
 
 say()  { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 note() { say "NOTE $*";  echo "::notice::$*"; }
@@ -342,17 +344,29 @@ while :; do
 
   if [ -s "$REASON" ]; then
     reason_msg="$(head -c 200 "$REASON")"
-    say "捕获到日志 429，尝试 WARP 换 IP..."
     : > "$REASON"
-    try_warp_refresh || true
-    stop_proc "$GW_PID" gateway
-    start_gateway
-    wait_local_health 60 || true
-    probe_once "$BOOT_BASE" 30
-    if [ "$(verdict)" != "ok" ]; then
-      rotate "日志命中 429 且换 IP 后仍失败：$reason_msg" fast
+    now=$SECONDS
+    if [ "$log_429_last" -gt 0 ] && [ $((now - log_429_last)) -le 60 ]; then
+      log_429_count=$((log_429_count + 1))
     else
-      say "WARP 换 IP 成功自愈！"
+      log_429_count=1
+    fi
+    log_429_last=$now
+    say "日志 429 #$log_429_count/3（60s 窗口），先观察"
+    if [ "$log_429_count" -ge 3 ]; then
+      log_429_count=0
+      say "连续日志 429，尝试 WARP 换 IP..."
+      try_warp_refresh || true
+      stop_proc "$GW_PID" gateway
+      start_gateway
+      wait_local_health 60 || true
+      probe_once "$BOOT_BASE" 30
+      if [ "$(verdict)" != "ok" ]; then
+        rotate "日志连续 429 且换 IP 后仍失败：$reason_msg" fast
+      else
+        log_429_count=0
+        say "WARP 换 IP 成功自愈！"
+      fi
     fi
   fi
 
@@ -384,6 +398,7 @@ while :; do
         ok_count=$((ok_count + 1))
         fail_count=0
         limit_count=0
+        log_429_count=0
         ;;
       limit)
         limit_count=$((limit_count + 1))
