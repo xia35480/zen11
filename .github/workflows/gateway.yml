@@ -75,59 +75,104 @@ jobs:
         id: cache-warp-deb
         uses: actions/cache@v4
         with:
-          path: /tmp/cloudflare-warp.deb
-          key: cloudflare-warp-deb-v2026.8
+          path: .cache/cloudflare-warp.deb
+          key: cloudflare-warp-deb-2026.8.2115.0
 
-      - name: Setup WARP (官方包 + apt 刷新依赖)
+      - name: Setup WARP (只提取 CLI/SVC，跳过 GUI 依赖)
         run: |
           set -euo pipefail
-          if [ "${{ steps.cache-warp-deb.outputs.cache-hit }}" != 'true' ] || [ ! -s /tmp/cloudflare-warp.deb ]; then
+          mkdir -p .cache
+          deb=.cache/cloudflare-warp.deb
+          if [ ! -s "$deb" ] || ! dpkg-deb --info "$deb" >/dev/null 2>&1; then
             echo "下载 cloudflare-warp 官方包..."
             curl -fsSL --retry 3 --retry-delay 1 \
-              -o /tmp/cloudflare-warp.deb \
+              -o "$deb" \
               https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
           fi
-          # runner 镜像里的 apt 索引可能比 mirror 旧（曾出现 libsoup 0.9 已被 0.10 替换导致 404），
-          # 先刷新索引再补依赖，避免 warp 安装被旧包版本卡死。
-          sudo apt-get -o Acquire::Retries=3 update -y
-          if ! sudo dpkg -i /tmp/cloudflare-warp.deb; then
-            echo "cloudflare-warp 依赖未满足，安装缺失依赖..."
-            sudo apt-get -o Acquire::Retries=3 install -f -y --fix-missing
-            sudo dpkg -i /tmp/cloudflare-warp.deb
+
+          # warp-svc 只需要这些运行库，不装 webkit/gtk GUI 依赖。
+          deps=(
+            libdbus-1-3 libnss3 libpcap0.8
+            libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64
+            iproute2 nftables libcap2-bin ca-certificates
+          )
+          if ! sudo apt-get install -y --no-install-recommends "${deps[@]}"; then
+            echo "依赖索引可能过期，刷新后重试..."
+            sudo apt-get -o Acquire::Retries=3 update -y
+            sudo apt-get install -y --no-install-recommends "${deps[@]}"
           fi
-          # postinst 与 systemd 有竞态：包刚装完 daemon 可能还没起，直接调 warp-cli 会报
-          # "Unable to connect ... No such file or directory"。显式启动并等 service active。
+
+          rm -rf /tmp/warp-extract
+          mkdir -p /tmp/warp-extract
+          dpkg-deb --fsys-tarfile "$deb" \
+            | tar -x -C /tmp/warp-extract \
+                ./bin/warp-svc ./bin/warp-cli ./lib/systemd/system/warp-svc.service
+
+          sudo install -m 0755 /tmp/warp-extract/bin/warp-svc /usr/bin/warp-svc
+          sudo install -m 0755 /tmp/warp-extract/bin/warp-cli /usr/bin/warp-cli
+          sudo install -m 0644 /tmp/warp-extract/lib/systemd/system/warp-svc.service \
+            /etc/systemd/system/warp-svc.service
+          sudo systemctl daemon-reload
           sudo systemctl enable warp-svc >/dev/null 2>&1 || true
-          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          sudo systemctl restart warp-svc
+
+          # 等 daemon socket 真正可用；systemctl is-active 不够，socket 可能还没建好。
           ready=0
-          for i in $(seq 1 30); do
-            if sudo systemctl is-active --quiet warp-svc; then ready=1; break; fi
-            sleep 1
+          for i in $(seq 1 60); do
+            if sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
+            sleep 0.25
           done
           if [ "$ready" != "1" ]; then
             echo "::error::cloudflare-warp daemon 未就绪"
             sudo systemctl status warp-svc --no-pager || true
-            ls -l /var/run/cloudflare-warp /run/cloudflare-warp 2>/dev/null || true
+            sudo journalctl -u warp-svc -n 80 --no-pager || true
             exit 1
           fi
-          sleep 1
-          sudo warp-cli --accept-tos registration new
-          sudo warp-cli --accept-tos mode warp+doh
-          sudo warp-cli --accept-tos connect
-          echo "WARP 官方客户端极速启动完毕"
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge 4 ]; then return 1; fi
+              sleep 1
+            done
+          }
+          retry sudo warp-cli --accept-tos registration new
+          retry sudo warp-cli --accept-tos mode warp+doh
+          retry sudo warp-cli --accept-tos connect
+
+          # connect 是异步的，必须等到真正 Connected 再做 DNS/网关。
+          connected=0
+          for i in $(seq 1 60); do
+            st="$(sudo warp-cli --accept-tos status 2>&1 || true)"
+            if printf '%s' "$st" | grep -qE 'Status update: Connected|warp=on'; then
+              connected=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$connected" != "1" ]; then
+            echo "::error::WARP 30s 内未连接"
+            sudo warp-cli --accept-tos status || true
+            sudo journalctl -u warp-svc -n 80 --no-pager || true
+            exit 1
+          fi
+          echo "WARP 已连接（提取模式，跳过 GUI 依赖）"
 
       - name: Fix DNS & Network Tuning (BBR + 双栈 DNS)
         run: |
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo systemctl disable systemd-resolved 2>/dev/null || true
           sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          sudo tee /etc/resolv.conf >/dev/null <<'EOF'
+          nameserver 1.1.1.1
+          nameserver 2606:4700:4700::1111
+          nameserver 8.8.8.8
+          nameserver 1.0.0.1
+          EOF
           sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
-          echo "Public IPv4: $(curl -s4 --max-time 6 https://api.ipify.org || echo '?')"
-          echo "Public IPv6: $(curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none')"
-          curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=|colo=' || true
 
       - name: Cache cloudflared binary
         id: cache-cloudflared

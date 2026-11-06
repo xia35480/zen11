@@ -37,6 +37,18 @@ say()  { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 note() { say "NOTE $*";  echo "::notice::$*"; }
 warn() { say "WARN $*";  echo "::warning::$*"; }
 
+warp_wait_connected() {
+  local deadline=$((SECONDS + ${1:-20}))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if sudo warp-cli --accept-tos status 2>/dev/null \
+      | grep -qE 'Status update: Connected|warp=on'; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 try_warp_refresh() {
   if command -v warp-cli >/dev/null 2>&1; then
     say "WARP: 重新注册以获取全新 Cloudflare 设备身份与双栈出口..."
@@ -46,7 +58,12 @@ try_warp_refresh() {
     sudo warp-cli --accept-tos registration new 2>/dev/null || true
     sudo warp-cli --accept-tos mode warp+doh 2>/dev/null || true
     sudo warp-cli --accept-tos connect 2>/dev/null || true
-    sleep 1.5
+    if warp_wait_connected 20; then
+      say "WARP: 连接已恢复"
+    else
+      warn "WARP: 20s 内未确认 Connected"
+    fi
+    sleep 0.5
     local new_ip new_v6
     new_ip="$(curl -s4 --max-time 6 https://api.ipify.org 2>/dev/null || echo '?')"
     new_v6="$(curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none')"
@@ -57,9 +74,16 @@ try_warp_refresh() {
   return 1
 }
 
-# 记录初始出口 IP
-curr_ip="$(curl -s4 --max-time 6 https://api.ipify.org 2>/dev/null || echo '?')"
-curr_v6="$(curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none')"
+# 记录初始出口 IP（IPv4/IPv6 并行探测，避免串行等待）
+( curl -s4 --max-time 6 https://api.ipify.org 2>/dev/null || echo '?' ) > "$RUN/ip4.tmp" &
+p4=$!
+( curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none' ) > "$RUN/ip6.tmp" &
+p6=$!
+wait "$p4" "$p6" 2>/dev/null || true
+curr_ip="$(cat "$RUN/ip4.tmp" 2>/dev/null || true)"
+curr_v6="$(cat "$RUN/ip6.tmp" 2>/dev/null || true)"
+[ -n "$curr_ip" ] || curr_ip='?'
+[ -n "$curr_v6" ] || curr_v6='none'
 printf '%s %s\n' "$curr_ip" "$curr_v6" > "$RUN/egress-ip.txt"
 say "WARP 初始出口 IPv4=$curr_ip IPv6=$curr_v6"
 
@@ -240,11 +264,13 @@ dump_boot_diag() {
 say "run start pid=$$ max=${MAX_RUN}s probe_interval=${PROBE_INTERVAL}s (WARP 模式)"
 
 start_gateway
-if ! wait_local_health 120; then
+if ! wait_local_health 60; then
   tail -n 40 "$GW_LOG" 2>/dev/null || true
-  rotate "本地 /health 120s 没起来"
+  rotate "本地 /health 60s 没起来"
 fi
 
+# 隧道先起，和本地 chat 探针并行，省掉串行等待。
+start_tunnel
 watch_logs
 
 # 优先执行本地真 chat 探针：验证网关 + WARP 出口是否真正拿到 200
@@ -255,7 +281,7 @@ boot_ok=0
 attempt=0
 while [ "$attempt" -lt "$BOOT_TRIES" ]; do
   attempt=$((attempt + 1))
-  probe_once "$BOOT_BASE"
+  probe_once "$BOOT_BASE" 30
   v="$(verdict)"
   say "boot probe (local) #$attempt/$BOOT_TRIES -> $PROBE_CODE ($v)"
   case "$v" in
@@ -286,9 +312,8 @@ if [ "$boot_ok" = "0" ]; then
   rotate "起手探测 $BOOT_TRIES 次没拿到 200（最后一次 $PROBE_CODE）"
 fi
 ok_count=$((ok_count + 1))
-note "网关就绪（WARP 本地 chat 200），开始起隧道"
+note "网关就绪（WARP 本地 chat 200），隧道已在后台启动"
 
-start_tunnel
 if [ -n "$PUBLIC_URL" ]; then
   note "验证公网隧道：$PUBLIC_URL/health"
   tunnel_ok=0
@@ -306,7 +331,7 @@ if [ -n "$PUBLIC_URL" ]; then
     warn "公网 /health 没回到 200（最后一次 $code），可能是新域名/回源解析中；本地 chat 200 已就绪，继续服务"
   fi
 fi
-note "IP 与出口验证完毕，开始服务"
+note "IP 与出口验证完毕，启动耗时 ${SECONDS}s，开始服务"
 
 next_probe=$((SECONDS + PROBE_INTERVAL))
 gw_restarts=0
