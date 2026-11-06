@@ -269,8 +269,6 @@ if ! wait_local_health 60; then
   rotate "本地 /health 60s 没起来"
 fi
 
-# 隧道先起，和本地 chat 探针并行，省掉串行等待。
-start_tunnel
 watch_logs
 
 # 优先执行本地真 chat 探针：验证网关 + WARP 出口是否真正拿到 200
@@ -312,8 +310,9 @@ if [ "$boot_ok" = "0" ]; then
   rotate "起手探测 $BOOT_TRIES 次没拿到 200（最后一次 $PROBE_CODE）"
 fi
 ok_count=$((ok_count + 1))
-note "网关就绪（WARP 本地 chat 200），隧道已在后台启动"
+note "网关就绪（WARP 本地 chat 200），开始起隧道"
 
+start_tunnel
 if [ -n "$PUBLIC_URL" ]; then
   note "验证公网隧道：$PUBLIC_URL/health"
   tunnel_ok=0
